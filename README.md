@@ -46,13 +46,17 @@ python scripts/convert_hf_to_gguf.py \
 
 Prerequisites:
 
-- A built llama.cpp tree (`libllama.so`, `libggml*.so`, headers under `ggml/include/` and
-  `include/`). Build it with the same backend you want here (`-DGGML_CUDA=ON` for NVIDIA, etc.).
-- CMake ≥ 3.18, a C++17 compiler.
+- A built llama.cpp tree. On Linux: `libllama.so`, `libggml*.so`; on Windows (MSVC):
+  `llama.dll`, `ggml.dll`, `ggml-base.dll` and their `.lib` import libraries.
+  Headers under `ggml/include/` and `include/`. Build it with the same backend you
+  want here (`-DGGML_CUDA=ON` for NVIDIA, etc.).
+- CMake ≥ 3.18, a C++17 compiler (GCC/Clang on Linux, MSVC on Windows).
 - `nlohmann/json.hpp` (only the header is needed; on Debian/Ubuntu: `apt install
-  nlohmann-json3-dev`).
+  nlohmann-json3-dev`). A vendored copy is included in `third_party/nlohmann/json.hpp`.
 - The HTTP server is built against a vendored copy of `cpp-httplib` v0.18.7
   (`third_party/cpp-httplib/httplib.h`); no extra system dep.
+
+### Linux
 
 ```bash
 cmake -B build \
@@ -61,11 +65,31 @@ cmake -B build \
 cmake --build build -j
 ```
 
-Outputs:
+### Windows
 
+Open a **Developer Command Prompt for VS** (or `vcvarsall.bat x64`), then:
+
+```cmd
+cmake -B build -DLLAMA_CPP_DIR=/path/to/llama.cpp -DGGML_CUDA=ON
+cmake --build build --config Release -j
+```
+
+The Windows build automatically:
+- Locates DLLs in `build/bin/Release/` and import libs in `build/src/Release/`
+- Copies llama.cpp DLLs (including CUDA) next to the executables via POST_BUILD steps
+- Links `ws2_32` (Winsock) for the HTTP server
+
+### Outputs
+
+Linux:
 - `build/moss-tts-cli`
 - `build/moss-tts-server`
 - `build/moss-tts-info`, `build/moss-tts-compute-test`, `build/moss-codec-roundtrip` (diagnostics)
+
+Windows:
+- `build/Release/moss-tts-cli.exe`
+- `build/Release/moss-tts-server.exe`
+- `build/tests/Release/moss-tts-info.exe`, etc.
 
 ## Convert weights
 
