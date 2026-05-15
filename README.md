@@ -1,6 +1,6 @@
 # openmoss-ggml
 
-A standalone C++/GGML port of [MOSS-TTS-Delay](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) — a
+A standalone C++/[GGML](https://www.github.com/ggml-org/ggml) port of [MOSS-TTS-Delay](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) — a
 Qwen3-8B language backbone + 32 RVQ audio codebooks + a 1.6 B pure-transformer audio codec, all
 runnable from one self-contained binary. The Qwen3 backbone is hosted by **libllama** (so you get
 all of llama.cpp's quantizations and CUDA / CPU / Vulkan backends for free); the embedding stack,
