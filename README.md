@@ -173,6 +173,7 @@ state is not reentrant); concurrent requests queue cleanly.
 - `GET /health` — readiness probe, returns `ok`.
 - `GET /info` — JSON with model dims, codec status, and the request counter.
 - `POST /tts` — JSON in, `audio/wav` out (or `text/plain` with the error message on failure).
+- `POST /v1/audio/speech` — OpenAI-compatible TTS endpoint.
 
 #### `POST /tts` request body
 
@@ -191,6 +192,21 @@ Response headers carry timing info: `X-MOSS-Audio-Frames`, `X-MOSS-Generate-Seco
 
 The payload limit is 64 MB, which fits a ~60 s reference WAV after base64 encoding.
 
+#### `POST /v1/audio/speech` — OpenAI-compatible endpoint
+
+Accepts the same JSON schema as the OpenAI TTS API.
+This allows drop-in compatibility with any client or SDK that targets the OpenAI API.
+
+| field              | type   | required | notes                                                       |
+|--------------------|--------|----------|-------------------------------------------------------------|
+| `input`            | string | yes      | text to synthesize (maps to native `text`)                  |
+| `model`            | string | no       | ignored (the model is already loaded at server startup)     |
+| `voice`            | string | no       | passed as an instruction hint to the model                  |
+| `response_format`  | string | no       | `"wav"` (default and only supported format)                 |
+| `speed`            | float  | no       | 0.25–4.0, scales the token budget (default 1.0)             |
+
+Response: `audio/wav` (16-bit PCM @ 24 kHz mono), same as the native endpoint.
+
 ### Examples
 
 ```bash
@@ -207,6 +223,31 @@ python3 -c "import base64,json,sys; \
     "A different sentence in the cloned voice." samples/alice.wav > req.json
 curl -s -X POST http://localhost:8080/tts \
     -H 'Content-Type: application/json' --data @req.json -o cloned.wav
+
+# OpenAI-compatible endpoint (works with the OpenAI Python SDK)
+curl -s -X POST http://localhost:8080/v1/audio/speech \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"tts-1","input":"Hello from the OpenAI-compatible endpoint!","voice":"alloy"}' \
+    -o openai_out.wav
+```
+
+#### Using with the OpenAI Python SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed"  # the server does not check authentication
+)
+
+response = client.audio.speech.create(
+    model="tts-1",
+    voice="alloy",
+    input="Hello! This is a test of the OpenAI-compatible TTS endpoint.",
+    response_format="wav"
+)
+response.stream_to_file("output.wav")
 ```
 
 ## GPU placement
