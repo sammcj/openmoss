@@ -158,7 +158,10 @@ class STShard:
         self._header = json.loads(header_bytes.decode("utf-8"))
         self._data_start = 8 + header_size
         # mmap the whole file lazily — we'll only access slices.
-        self._mm = mmap.mmap(self._fp.fileno(), 0, prot=mmap.PROT_READ)
+        if sys.platform == "win32":
+            self._mm = mmap.mmap(self._fp.fileno(), 0, access=mmap.ACCESS_READ)
+        else:
+            self._mm = mmap.mmap(self._fp.fileno(), 0, prot=mmap.PROT_READ)
 
     def keys(self):
         return [k for k in self._header.keys() if k != "__metadata__"]
@@ -337,14 +340,20 @@ def extract_qwen3_backbone(moss_dir: Path, out_dir: Path) -> dict:
     for i, name in enumerate(saved, 1):
         new = f"model-{i:05d}-of-{total:05d}.safetensors"
         if name != new:
-            (out_dir / name).rename(out_dir / new)
+            target = out_dir / new
+            if target.exists():
+                target.unlink()
+            (out_dir / name).rename(target)
             for tn in [k for k, v in new_weight_map.items() if v == name]:
                 new_weight_map[tn] = new
 
     if total == 1:
         # No index needed for single-shard; rename to the canonical name.
         only = next(iter(new_weight_map.values()))
-        (out_dir / only).rename(out_dir / "model.safetensors")
+        target = out_dir / "model.safetensors"
+        if target.exists():
+            target.unlink()
+        (out_dir / only).rename(target)
     else:
         total_size = sum((out_dir / s).stat().st_size for s in set(new_weight_map.values()))
         with (out_dir / "model.safetensors.index.json").open("w") as f:
