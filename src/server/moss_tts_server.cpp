@@ -8,13 +8,14 @@
 // ---
 //   GET  /health                       → "ok\n"  (200)
 //   GET  /info                         → JSON with model dims + load options
+//   POST /v1/audio/speech              → OpenAI-compatible TTS endpoint
 //   POST /tts
 //        Content-Type: application/json
 //        Body: see TtsRequest below.
 //        Response: 200 audio/wav (16-bit PCM @ 24 kHz mono)
 //                   on error: 4xx / 5xx text/plain with the message.
 //
-// Request schema (all fields optional except `text`):
+// /tts endpoint request schema (all fields optional except `text`):
 //   {
 //     "text":              str,       // required
 //     "instruction":       str,
@@ -27,6 +28,15 @@
 //        "audio_temperature": float, "audio_top_p": float, "audio_top_k": int,
 //        "audio_repetition_penalty": float, "seed": uint64
 //     }
+//   }
+//
+// /v1/audio/speech request schema:
+//   {
+//     "model":             str,       // ignored (model is pre-loaded)
+//     "input":             str,       // required — text to synthesize
+//     "voice":             str,       // optional — mapped to instruction or ignored
+//     "response_format":   str,       // "wav" (default), only WAV is supported
+//     "speed":             float      // optional — 0.25..4.0, maps to token count
 //   }
 
 #include <atomic>
@@ -235,6 +245,93 @@ int main(int argc, char ** argv) {
                 (unsigned long long)req_id,
                 req.text.size(),
                 req.reference_wav ? "yes" : "no",
+                req.max_new_tokens);
+            result = openmoss::generate(*model, req);
+        } catch (const std::exception & e) {
+            return send_text_error(rs, 500,
+                std::string("generation failed: ") + e.what());
+        }
+
+        if (result.waveform.empty()) {
+            return send_text_error(rs, 500,
+                "generation produced no audio (codec missing or model emitted EOS too early)");
+        }
+
+        auto wav_bytes = openmoss::encode_wav_mono(
+            result.waveform.data(), int64_t(result.waveform.size()),
+            model->dims().sampling_rate);
+
+        const std::chrono::duration<double> total_s =
+            std::chrono::steady_clock::now() - t0;
+        std::fprintf(stderr,
+            "[server] req#%llu ok: %zu samples (%.2fs audio) — prefill %.2fs gen %.2fs decode %.2fs total %.2fs\n",
+            (unsigned long long)req_id,
+            result.waveform.size(),
+            result.waveform.size() / double(model->dims().sampling_rate),
+            result.prefill_seconds,
+            result.generate_seconds,
+            result.decode_seconds,
+            total_s.count());
+
+        rs.set_header("X-MOSS-Audio-Frames", std::to_string(result.n_audio_frames));
+        rs.set_header("X-MOSS-Generate-Seconds",
+                       std::to_string(result.generate_seconds));
+        rs.set_header("X-MOSS-Decode-Seconds",
+                       std::to_string(result.decode_seconds));
+        rs.set_content(reinterpret_cast<const char *>(wav_bytes.data()),
+                        wav_bytes.size(), "audio/wav");
+    });
+
+    svr.Post("/v1/audio/speech", [&](const httplib::Request & rq, httplib::Response & rs) {
+        const uint64_t req_id = ++n_requests;
+        const auto t0 = std::chrono::steady_clock::now();
+
+        json body;
+        try {
+            body = json::parse(rq.body);
+        } catch (const std::exception & e) {
+            return send_text_error(rs, 400,
+                std::string("invalid JSON body: ") + e.what());
+        }
+        if (!body.is_object()) return send_text_error(rs, 400, "JSON body must be an object");
+        if (!body.contains("input") || !body["input"].is_string())
+            return send_text_error(rs, 400, "missing required field 'input' (string)");
+
+        // Check response_format — only "wav" is supported.
+        std::string fmt = jget(body, "response_format", std::string("wav"));
+        if (fmt != "wav") {
+            return send_text_error(rs, 400,
+                "unsupported response_format '" + fmt + "'; only 'wav' is supported");
+        }
+
+        // Translate OpenAI fields → native MOSS GenerateRequest.
+        openmoss::GenerateRequest req;
+        req.text = body["input"].get<std::string>();
+
+        // "voice" → instruction hint (e.g. "alloy", "echo", …).
+        if (body.contains("voice") && body["voice"].is_string()) {
+            req.instruction = body["voice"].get<std::string>();
+        }
+
+        // "speed" scales the token budget.  speed=1.0 → default max_new_tokens.
+        // We approximate: 1s of audio ≈ 12.5 tokens, and the default model output
+        // is roughly 4096 tokens ≈ 328s.  speed just multiplies the budget.
+        double speed = jget(body, "speed", 1.0);
+        if (speed <= 0.0 || speed > 4.0) {
+            return send_text_error(rs, 400,
+                "speed must be between 0.25 and 4.0");
+        }
+        // Scale the default token budget by speed (lower speed = fewer tokens = shorter audio).
+        req.max_new_tokens = std::max(1, int(4096 / speed));
+
+        openmoss::GenerateResult result;
+        try {
+            std::lock_guard<std::mutex> g(gen_mu);
+            std::fprintf(stderr,
+                "[server] req#%llu /v1/audio/speech input=%zu chars speed=%.2f max=%d\n",
+                (unsigned long long)req_id,
+                req.text.size(),
+                speed,
                 req.max_new_tokens);
             result = openmoss::generate(*model, req);
         } catch (const std::exception & e) {
