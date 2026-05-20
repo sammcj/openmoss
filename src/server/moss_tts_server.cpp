@@ -70,6 +70,9 @@ namespace {
         "  --port PORT            (default: 8080)\n"
         "  --n-gpu-layers N       (default: -1 = all)\n"
         "  --main-gpu N           (default: -1 = auto, picks GPU with most free VRAM)\n"
+        "  --n-batch N            libllama batch size (default: 512). Raise if a\n"
+        "                         long prompt exceeds this size.\n"
+        "  --n-ctx N              libllama context size (default: 8192)\n"
         "  --no-flash-attn\n"
         "  --skip-codec           (no waveform synthesis; codes only — debug)\n"
         "  --aux-cpu              force audio embeds + codec onto CPU\n"
@@ -178,6 +181,8 @@ int main(int argc, char ** argv) {
     int  port         = 8080;
     int  n_gpu_layers = -1;
     int  main_gpu     = -1;
+    int  n_batch      = -1;
+    int  n_ctx        = -1;
     bool flash_attn   = true;
     bool skip_codec   = false;
     bool aux_cpu      = false;
@@ -195,6 +200,8 @@ int main(int argc, char ** argv) {
         else if (k == "--port")           port         = std::atoi(next().c_str());
         else if (k == "--n-gpu-layers")   n_gpu_layers = std::atoi(next().c_str());
         else if (k == "--main-gpu")       main_gpu     = std::atoi(next().c_str());
+        else if (k == "--n-batch")        n_batch      = std::atoi(next().c_str());
+        else if (k == "--n-ctx")          n_ctx        = std::atoi(next().c_str());
         else if (k == "--no-flash-attn")  flash_attn   = false;
         else if (k == "--skip-codec")     skip_codec   = true;
         else if (k == "--aux-cpu")        aux_cpu      = true;
@@ -208,6 +215,8 @@ int main(int argc, char ** argv) {
     openmoss::LoadOptions lo;
     lo.n_gpu_layers = n_gpu_layers;
     lo.main_gpu     = main_gpu;
+    if (n_batch > 0) lo.n_batch = n_batch;
+    if (n_ctx   > 0) lo.n_ctx   = n_ctx;
     lo.flash_attn   = flash_attn;
     lo.skip_codec   = skip_codec;
     lo.aux_cpu      = aux_cpu;
