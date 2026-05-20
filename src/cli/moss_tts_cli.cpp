@@ -24,6 +24,8 @@ struct Args {
     std::optional<int> tokens;
     int  n_gpu_layers = -1;
     int  main_gpu = -1;
+    int  n_batch  = -1;
+    int  n_ctx    = -1;
     int  max_new_tokens = 4096;
     bool flash_attn = true;
     bool skip_codec = false;
@@ -45,6 +47,9 @@ struct Args {
         "  --language CODE        Language code hint (en/zh/...)\n"
         "  --tokens N             Approximate audio token count (1s ≈ 12.5 tokens)\n"
         "  --max-new-tokens N     Generation cap (default: 4096)\n"
+        "  --n-batch N            libllama batch size (default: 512). Raise if a\n"
+        "                         long prompt exceeds this size.\n"
+        "  --n-ctx N              libllama context size (default: 8192)\n"
         "  --n-gpu-layers N       Backbone GPU offload (default: all)\n"
         "  --main-gpu N           GPU device index to pin model to\n"
         "                         (default: auto, picks GPU with most free VRAM)\n"
@@ -82,6 +87,8 @@ int main(int argc, char ** argv) {
         else if (k == "--max-new-tokens")  a.max_new_tokens = require_int(i, argc, argv);
         else if (k == "--n-gpu-layers")    a.n_gpu_layers = require_int(i, argc, argv);
         else if (k == "--main-gpu")        a.main_gpu     = require_int(i, argc, argv);
+        else if (k == "--n-batch")         a.n_batch      = require_int(i, argc, argv);
+        else if (k == "--n-ctx")           a.n_ctx        = require_int(i, argc, argv);
         else if (k == "--no-flash-attn")   a.flash_attn = false;
         else if (k == "--skip-codec")      a.skip_codec = true;
         else if (k == "--aux-cpu")         a.aux_cpu    = true;
@@ -93,6 +100,8 @@ int main(int argc, char ** argv) {
     openmoss::LoadOptions lo;
     lo.n_gpu_layers = a.n_gpu_layers;
     lo.main_gpu     = a.main_gpu;
+    if (a.n_batch > 0) lo.n_batch = a.n_batch;
+    if (a.n_ctx   > 0) lo.n_ctx   = a.n_ctx;
     lo.flash_attn   = a.flash_attn;
     lo.skip_codec   = a.skip_codec;
     lo.aux_cpu      = a.aux_cpu;
