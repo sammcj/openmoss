@@ -10,11 +10,17 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "openmoss/model.h"
 
 namespace openmoss {
+
+// Defined in delay.cpp; held per-DelayState so each generation seeds its own
+// stream (a single static RNG would ignore per-request seeds and leak state
+// across requests on the persistent server).
+struct Rng;
 
 struct SamplingConfig {
     float text_temperature  = 1.5f;
@@ -38,6 +44,7 @@ struct DelayStep {
 class DelayState {
 public:
     DelayState(const ModelDims & dims, const std::vector<std::vector<int32_t>> & prompt_ids);
+    ~DelayState();
 
     // Advance one step given:
     //   text_logits:  (vocab,)
@@ -58,6 +65,7 @@ private:
     int64_t         m_audio_length   = 0;
     int64_t         m_delayed_length = -1;     // -1 sentinel ≈ INT64_MAX
     std::vector<std::vector<int32_t>> m_history; // (T, 1+n_vq)
+    std::unique_ptr<Rng> m_rng;                  // seeded lazily on first step()
 };
 
 } // namespace openmoss

@@ -313,6 +313,12 @@ std::unique_ptr<Model> Model::load(const std::string & gguf_path, const LoadOpti
     cp.n_threads       = opts.n_threads;
     cp.n_threads_batch = opts.n_threads;
     cp.embeddings      = true; // we feed and read embeddings directly
+    // We need the *per-token* last hidden state (fed to the audio LM heads), not
+    // a pooled sentence embedding. With pooling_type left UNSPECIFIED, recent
+    // llama.cpp resolves it to a sequence-pooling mode for some archs, which
+    // makes llama_get_embeddings_ith() return null ("no embeddings"). Force NONE
+    // so every token's hidden state is retrievable via llama_get_embeddings_ith.
+    cp.pooling_type    = LLAMA_POOLING_TYPE_NONE;
     cp.flash_attn_type = opts.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     self->m_backbone_ctx = llama_init_from_model(self->m_backbone_model, cp);
     if (!self->m_backbone_ctx) {
@@ -436,6 +442,11 @@ std::unique_ptr<Model> Model::load(const std::string & gguf_path, const LoadOpti
         self->m_aux->text_embed
         ? int32_t(self->m_aux->text_embed->ne[1])
         : 0;
+    // Mirror the real backbone vocab into ModelDims so the sampler masks/samples
+    // over the correct range (v1.5 may differ from v1.0's 155 648).
+    if (self->m_aux->text_vocab_size > 0) {
+        self->m_dims.text_vocab_size = self->m_aux->text_vocab_size;
+    }
     self->m_aux->galloc =
         ggml_gallocr_new(ggml_backend_get_default_buffer_type(self->m_aux->backend));
 

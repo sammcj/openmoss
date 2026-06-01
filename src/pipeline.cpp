@@ -311,6 +311,12 @@ GenerateResult generate(Model & model,
     result.generate_seconds = seconds_t(clock_t_::now() - t_gen).count();
     std::fprintf(stderr, "[generate] generated %d steps in %.2fs (%.1f tok/s)\n",
                  step, result.generate_seconds, step / std::max(result.generate_seconds, 1e-6));
+    if (step >= req.max_new_tokens && !last_step.stop) {
+        std::fprintf(stderr,
+            "[generate] WARNING: hit max_new_tokens (%d) without an end-of-speech token; "
+            "audio may be truncated and codec decode may be rejected as too long\n",
+            req.max_new_tokens);
+    }
 
     // ── 4. Extract audio codes ─────────────────────────────────────────────
     int32_t nvq_out = 0, t_audio = 0;

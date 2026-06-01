@@ -31,6 +31,7 @@ struct ModelDims {
     int32_t audio_pad_code    = 1024;
     int32_t sampling_rate     = 24000;
     int32_t downsample_rate   = 1920;   // codec hop size
+    int32_t text_vocab_size   = 155648; // Qwen3 backbone vocab; set from token_embd at load
 
     // Special token ids in the Qwen3 vocab — populated from GGUF metadata.
     int32_t pad_token_id                  = 151643;

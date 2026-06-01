@@ -53,8 +53,8 @@ namespace openmoss {
 // Sampling helpers (CPU side; logits are tiny — vocab ≤ 1025 audio, ~155k text)
 // ──────────────────────────────────────────────────────────────────────────
 
-namespace {
-
+// Declared in delay.h (forward-declared there, defined here) so DelayState can
+// own one per instance.
 struct Rng {
     std::mt19937_64 g;
     explicit Rng(uint64_t seed) {
@@ -68,6 +68,8 @@ struct Rng {
         return std::uniform_real_distribution<float>(0.f, 1.f)(g);
     }
 };
+
+namespace {
 
 void apply_repetition_penalty(float * logits, int vocab,
                               const std::vector<int32_t> & history,
@@ -174,6 +176,8 @@ int32_t sample_one(float * logits, int vocab, float temperature,
 // DelayState
 // ──────────────────────────────────────────────────────────────────────────
 
+DelayState::~DelayState() = default;
+
 DelayState::DelayState(const ModelDims & dims,
                        const std::vector<std::vector<int32_t>> & prompt_ids)
     : m_dims(dims), m_history(prompt_ids) {
@@ -208,12 +212,12 @@ DelayStep DelayState::step(const float * text_logits,
     const int32_t aud_v        = m_dims.audio_vocab_size; // 1024
     const int32_t aud_v_full   = aud_v + 1;                // 1025
     const int32_t pad_code     = m_dims.audio_pad_code;
-    const int32_t text_vocab   = int32_t(/*derived from logits caller side*/ 0);
-    (void)text_vocab; // we don't get an explicit vocab size; rely on caller-provided buffer
 
-    // Static RNG seeded once per state (not per step).
-    static thread_local std::unique_ptr<Rng> rng;
-    if (!rng) rng = std::make_unique<Rng>(sc.seed);
+    // RNG is owned per DelayState (per request) and seeded lazily on first use,
+    // so each generation honours its own sc.seed and no state leaks across the
+    // server's requests.
+    if (!m_rng) m_rng = std::make_unique<Rng>(sc.seed);
+    Rng & rng = *m_rng;
 
     DelayStep result;
     result.ids.assign(1 + n_vq, pad_code);
@@ -237,11 +241,9 @@ DelayStep DelayState::step(const float * text_logits,
     } else {
         // Sample text from the (caller-provided, copied) logits buffer.
         // We need a mutable copy to apply masking; the caller owns the original.
-        // The caller has already pre-masked using their knowledge of vocab size.
-        // Heuristic: if the first 200k entries are not all -inf, treat that as the vocab.
-        // Cleaner: caller passes vocab via a side channel — but for this version
-        // we use a fixed 155 648 (Qwen3-8B vocab).
-        const int text_vocab_size = 155648;
+        // Vocab size comes from the loaded backbone (token_embd rows), not a
+        // hard-coded constant, so v1.5 backbones with a different vocab work.
+        const int text_vocab_size = m_dims.text_vocab_size;
         std::vector<float> tmp(text_logits, text_logits + text_vocab_size);
 
         // Mask special tokens that must not appear here.
@@ -268,7 +270,7 @@ DelayStep DelayState::step(const float * text_logits,
 
         next_text = sample_one(tmp.data(), text_vocab_size,
                                sc.text_temperature, sc.text_top_p, sc.text_top_k,
-                               sc.text_temperature > 0.f, *rng);
+                               sc.text_temperature > 0.f, rng);
 
         if (next_text == m_dims.audio_start_token_id)  m_is_audio = true;
         if (next_text == m_dims.im_end_token_id)        m_is_stopping = true;
@@ -312,7 +314,7 @@ DelayStep DelayState::step(const float * text_logits,
         }
         result.ids[1 + i] = sample_one(abuf.data(), aud_v_full,
                                        sc.audio_temperature, sc.audio_top_p, sc.audio_top_k,
-                                       sc.audio_temperature > 0.f, *rng);
+                                       sc.audio_temperature > 0.f, rng);
     }
 
     // ── Update state ──────────────────────────────────────────────────────
@@ -325,6 +327,13 @@ DelayStep DelayState::step(const float * text_logits,
         m_audio_length = 0;
     }
 
+    // delayed_length convention here differs from the reference by one (the
+    // reference jumps MAX→0→1 in a single step; here it stays at 0 on the
+    // transition step). This is deliberate and matched by extract_audio_codes,
+    // which uses `T - n_vq` (not `T - n_vq + 1`): the extra flush frame the
+    // off-by-one produces is exactly the one that convention drops, so the
+    // emitted frame set is identical to the reference. Do NOT "fix" one without
+    // the other — see extract_audio_codes.
     if (m_delayed_length < 0 && next_text == m_dims.audio_assistant_delay_slot_token_id) {
         m_delayed_length = 0;
     } else if (m_delayed_length >= 0) {

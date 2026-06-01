@@ -227,14 +227,18 @@ private:
                                     ggml_tensor * w, ggml_tensor * b) const;
     ggml_tensor * build_attention_(ggml_context * gctx, ggml_tensor * x,
                                     const Layer & L, int d_model, int n_heads,
-                                    ggml_tensor * pos) const;
+                                    ggml_tensor * pos, ggml_tensor * mask) const;
     ggml_tensor * build_ffn_(ggml_context * gctx, ggml_tensor * x,
                               const Layer & L) const;
     ggml_tensor * build_layer_(ggml_context * gctx, ggml_tensor * x,
                                 const Layer & L, int d_model, int n_heads,
-                                ggml_tensor * pos) const;
+                                ggml_tensor * pos, ggml_tensor * mask) const;
     ggml_tensor * build_stage_(ggml_context * gctx, ggml_tensor * x,
-                                const Stage & S, ggml_tensor * pos) const;
+                                const Stage & S, ggml_tensor * pos,
+                                ggml_tensor * mask) const;
+    // Build an (T, T) f16 causal mask input tensor for flash attention.
+    static ggml_tensor * make_causal_mask_(ggml_context * gctx, int64_t T);
+    static void fill_causal_mask_(ggml_tensor * mask);
     static ggml_tensor * patch_upsample_(ggml_context * gctx,
                                           ggml_tensor * x, int patch);
     static ggml_tensor * patch_downsample_(ggml_context * gctx,
@@ -581,7 +585,8 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
                                              const Layer & L,
                                              int d_model,
                                              int n_heads,
-                                             ggml_tensor * pos) const {
+                                             ggml_tensor * pos,
+                                             ggml_tensor * mask) const {
     const int head_dim = d_model / n_heads;
     const int T        = int(x->ne[1]);
 
@@ -613,26 +618,29 @@ ggml_tensor * CodecGraphs::build_attention_(ggml_context * gctx,
                       head_dim, GGML_ROPE_TYPE_NORMAL, T,
                       ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // Manual SDPA. Permute to put T at ne[1] and heads at ne[2] (= batch).
-    ggml_tensor * Qp = ggml_cont(gctx, ggml_permute(gctx, Q, 0, 2, 1, 3));   // (head_dim, T, n_heads)
-    ggml_tensor * Kp = ggml_cont(gctx, ggml_permute(gctx, K, 0, 2, 1, 3));   // (head_dim, T, n_heads)
-    ggml_tensor * Vp = ggml_cont(gctx, ggml_permute(gctx, V, 0, 2, 1, 3));   // (head_dim, T, n_heads)
+    // Flash attention (causal). We previously did a manual SDPA
+    // (scores = KᵀQ → scale → diag_mask_inf → soft_max → ·V), but ggml_soft_max
+    // aborts on some CUDA builds ("SOFT_MAX failed: invalid argument") and the
+    // explicit (T×T×n_heads) scores buffer is O(T²) memory — at long T that
+    // alone needs tens of GB. ggml_flash_attn_ext streams the softmax (no
+    // materialised scores) and runs the same well-exercised kernel the llama
+    // backbone uses, so it works on every backend we target.
+    //
+    // Layout flash_attn_ext expects: q/k/v = (head_dim, T, n_heads).
+    ggml_tensor * Qp = ggml_cont(gctx, ggml_permute(gctx, Q, 0, 2, 1, 3));   // (head_dim, T, n_heads) f32
+    ggml_tensor * Kp = ggml_cont(gctx, ggml_permute(gctx, K, 0, 2, 1, 3));
+    ggml_tensor * Vp = ggml_cont(gctx, ggml_permute(gctx, V, 0, 2, 1, 3));
 
-    // scores = Kᵀ Q  → (T_k, T_q, n_heads)
-    ggml_tensor * scores = ggml_mul_mat(gctx, Kp, Qp);
-    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    // The kernel wants F16 K/V (matches the backbone's KV path); the mask is
+    // already F16. Q stays F32.
+    ggml_tensor * Kh = ggml_cast(gctx, Kp, GGML_TYPE_F16);
+    ggml_tensor * Vh = ggml_cast(gctx, Vp, GGML_TYPE_F16);
 
-    // soft_max( scores * scale + causal_mask )
-    scores = ggml_scale(gctx, scores, 1.0f / std::sqrt(float(head_dim)));
-    scores = ggml_diag_mask_inf_inplace(gctx, scores, /*n_past=*/0);
-    scores = ggml_soft_max(gctx, scores);
-
-    // out = V · scores. Need T_k contracted, so transpose V's first two axes.
-    ggml_tensor * Vp_t = ggml_cont(gctx, ggml_permute(gctx, Vp, 1, 0, 2, 3)); // (T, head_dim, n_heads)
-    ggml_tensor * attn = ggml_mul_mat(gctx, Vp_t, scores);                    // (head_dim, T_q, n_heads)
-
-    // back to (head_dim, n_heads, T) so we can flatten heads into d_model
-    attn = ggml_cont(gctx, ggml_permute(gctx, attn, 0, 2, 1, 3));
+    ggml_tensor * attn = ggml_flash_attn_ext(gctx, Qp, Kh, Vh, mask,
+                                             1.0f / std::sqrt(float(head_dim)),
+                                             /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+    // result: (head_dim, n_heads, T) contiguous → flatten heads into d_model.
     attn = ggml_reshape_2d(gctx, attn, d_model, T);
 
     // output projection
@@ -654,10 +662,11 @@ ggml_tensor * CodecGraphs::build_layer_(ggml_context * gctx,
                                          const Layer & L,
                                          int d_model,
                                          int n_heads,
-                                         ggml_tensor * pos) const {
+                                         ggml_tensor * pos,
+                                         ggml_tensor * mask) const {
     // attn block
     ggml_tensor * y = build_layer_norm_(gctx, x, L.norm1_w, L.norm1_b);
-    y = build_attention_(gctx, y, L, d_model, n_heads, pos);
+    y = build_attention_(gctx, y, L, d_model, n_heads, pos, mask);
     y = ggml_mul(gctx, y, to_f32_(gctx, L.layer_scale_1));
     x = ggml_add(gctx, x, y);
 
@@ -674,13 +683,37 @@ ggml_tensor * CodecGraphs::build_layer_(ggml_context * gctx,
 ggml_tensor * CodecGraphs::build_stage_(ggml_context * gctx,
                                          ggml_tensor * x,
                                          const Stage & S,
-                                         ggml_tensor * pos) const {
+                                         ggml_tensor * pos,
+                                         ggml_tensor * mask) const {
     if (S.iproj) x = ggml_mul_mat(gctx, S.iproj, x);
     for (const Layer & L : S.layers) {
-        x = build_layer_(gctx, x, L, S.spec.d_model, S.spec.n_heads, pos);
+        x = build_layer_(gctx, x, L, S.spec.d_model, S.spec.n_heads, pos, mask);
     }
     if (S.oproj) x = ggml_mul_mat(gctx, S.oproj, x);
     return x;
+}
+
+// Causal mask for flash attention: (T, T) f16, mask[kv, q] = 0 if kv <= q else
+// -inf (lower-triangular). ne[0]=n_kv is the inner/contiguous dim. Created as a
+// graph input and filled after allocation (see decode/encode).
+ggml_tensor * CodecGraphs::make_causal_mask_(ggml_context * gctx, int64_t T) {
+    ggml_tensor * m = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, T, T);
+    ggml_set_input(m);
+    return m;
+}
+
+void CodecGraphs::fill_causal_mask_(ggml_tensor * mask) {
+    const int64_t T = mask->ne[0];
+    static const uint16_t F16_ZERO = 0x0000;
+    static const uint16_t F16_NEG_INF = 0xFC00;
+    std::vector<uint16_t> buf(size_t(T) * size_t(T));
+    for (int64_t q = 0; q < T; ++q) {
+        uint16_t * row = buf.data() + size_t(q) * size_t(T);
+        for (int64_t kv = 0; kv < T; ++kv) {
+            row[kv] = (kv <= q) ? F16_ZERO : F16_NEG_INF;
+        }
+    }
+    ggml_backend_tensor_set(mask, buf.data(), 0, buf.size() * sizeof(uint16_t));
 }
 
 // PyTorch:  x.reshape(b, d, h, l).permute(0, 1, 3, 2).reshape(b, d, l*h)
@@ -753,6 +786,27 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     }
     if (T_audio <= 0) return {};
 
+    // Flash attention streams the softmax, so there's no O(T²) scores buffer
+    // anymore — but each stage still needs an (T×T) f16 causal mask, and the
+    // last stage runs at 8·T_audio. A runaway generation (model never emits an
+    // end-of-speech token) could ask for thousands of frames, whose mask alone
+    // would balloon to many GB. Refuse early with an actionable message instead
+    // of attempting a doomed allocation.
+    {
+        const int64_t T_last     = int64_t(T_audio) * 8;             // last decoder stage
+        const int64_t mask_bytes = T_last * T_last * int64_t(sizeof(uint16_t)); // f16 causal mask
+        const int64_t cap_bytes  = int64_t(8) * 1024 * 1024 * 1024;  // ~8 GiB
+        if (mask_bytes > cap_bytes) {
+            const double secs = T_audio * 1920.0 / 24000.0;
+            throw std::runtime_error(
+                "CodecGraphs::decode: refusing to decode " + std::to_string(T_audio) +
+                " frames (~" + std::to_string(int(secs)) + "s): the codec attention "
+                "mask alone would need ~" + std::to_string(mask_bytes >> 30) +
+                " GiB. This usually means generation never emitted an end-of-speech "
+                "token (try a lower --max-new-tokens / different sampling).");
+        }
+    }
+
     const int n_samples = T_audio * 1920;
 
     // ── Build graph ────────────────────────────────────────────────────────
@@ -780,10 +834,13 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     T_at[2] = T_at[1] * DECODER_STAGES[1].patch_after;
     T_at[3] = T_at[2] * DECODER_STAGES[2].patch_after;
     std::array<ggml_tensor *, 4> pos_T {};
+    std::array<ggml_tensor *, 4> mask_T {};
     for (int s = 0; s < 4; ++s) {
         pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_at[s]);
         ggml_set_name(pos_T[s], ("pos_" + std::to_string(s)).c_str());
         ggml_set_input(pos_T[s]);
+        mask_T[s] = make_causal_mask_(gctx, T_at[s]);
+        ggml_set_name(mask_T[s], ("mask_" + std::to_string(s)).c_str());
     }
 
     // ── Quantizer.decode_codes ─────────────────────────────────────────────
@@ -802,7 +859,7 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
 
     // ── 4 transformer stages, each followed by a patch upsample ───────────
     for (int s = 0; s < 4; ++s) {
-        x = build_stage_(gctx, x, m_stages[s], pos_T[s]);
+        x = build_stage_(gctx, x, m_stages[s], pos_T[s], mask_T[s]);
         if (m_stages[s].spec.patch_after > 0) {
             x = patch_upsample_(gctx, x, m_stages[s].spec.patch_after);
         }
@@ -834,6 +891,7 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
         for (int t = 0; t < T_at[s]; ++t) p[size_t(t)] = t;
         ggml_backend_tensor_set(pos_T[s], p.data(), 0,
                                 p.size() * sizeof(int32_t));
+        fill_causal_mask_(mask_T[s]);
     }
 
     if (ggml_backend_graph_compute(aux->backend, graph) != GGML_STATUS_SUCCESS) {
@@ -894,10 +952,13 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
     T_at[2] = T_at[1] / ENCODER_STAGES[1].patch_after;               // input to enc.5
     T_at[3] = T_at[2] / ENCODER_STAGES[2].patch_after;               // input to enc.7
     std::array<ggml_tensor *, 4> pos_T {};
+    std::array<ggml_tensor *, 4> mask_T {};
     for (int s = 0; s < 4; ++s) {
         pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_at[s]);
         ggml_set_name(pos_T[s], ("enc_pos_" + std::to_string(s)).c_str());
         ggml_set_input(pos_T[s]);
+        mask_T[s] = make_causal_mask_(gctx, T_at[s]);
+        ggml_set_name(mask_T[s], ("enc_mask_" + std::to_string(s)).c_str());
     }
 
     // Initial patch=240 downsample: (1, T_padded) → (240, T_padded/240)
@@ -905,7 +966,7 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
 
     // Four encoder stages, each followed by a patch downsample (except the last).
     for (int s = 0; s < 4; ++s) {
-        x = build_stage_(gctx, x, m_enc_stages[s], pos_T[s]);
+        x = build_stage_(gctx, x, m_enc_stages[s], pos_T[s], mask_T[s]);
         if (m_enc_stages[s].spec.patch_after > 0) {
             x = patch_downsample_(gctx, x, m_enc_stages[s].spec.patch_after);
         }
@@ -964,6 +1025,7 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
         p.resize(size_t(T_at[s]));
         for (int t = 0; t < T_at[s]; ++t) p[size_t(t)] = t;
         ggml_backend_tensor_set(pos_T[s], p.data(), 0, p.size() * sizeof(int32_t));
+        fill_causal_mask_(mask_T[s]);
     }
 
     if (ggml_backend_graph_compute(aux->backend, graph) != GGML_STATUS_SUCCESS) {
