@@ -94,6 +94,11 @@ Windows:
 
 ## Convert weights
 
+**Pre-built GGUFs:** [`ilintar/moss-tts-gguf`](https://huggingface.co/ilintar/moss-tts-gguf) —
+`moss-tts-1.5-q8_0.gguf` (recommended) and `moss-tts-1.5.gguf` (f16), each with its
+`*.extras.gguf` sidecar. Download both files for a variant and pass the backbone to `--model`
+(the sidecar is auto-located alongside it). Or convert your own:
+
 The converter produces **two** GGUF files alongside each other:
 
 - `moss-tts.gguf` — the Qwen3-8B backbone, pure Qwen3 layout that libllama can load directly.
