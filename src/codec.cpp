@@ -780,9 +780,12 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
         throw std::runtime_error("CodecGraphs::decode: codec tensors not loaded "
                                   "(rebuild with --codec, and don't pass --skip-codec)");
     }
-    if (n_vq != CODEC_NUM_VQ) {
-        throw std::runtime_error("CodecGraphs::decode: expected n_vq=32, got "
-                                  + std::to_string(n_vq));
+    // Models may use a prefix of the RVQ codebooks (MOSS-TTS = all 32; smaller
+    // variants like MOSS-VoiceGenerator generate 16). Decode the first n_vq
+    // codebooks; the codec sums residuals coarse-to-fine, so a prefix is valid.
+    if (n_vq < 1 || n_vq > CODEC_NUM_VQ) {
+        throw std::runtime_error("CodecGraphs::decode: n_vq must be 1.."
+                                  + std::to_string(CODEC_NUM_VQ) + ", got " + std::to_string(n_vq));
     }
     if (T_audio <= 0) return {};
 
@@ -820,8 +823,8 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     // Inputs:
     //   - codes_in[i]: (T_audio,) int32, one per quantizer
     //   - pos_T[s]:    (T_at_stage_s,) int32, one per decoder stage (T grows)
-    std::vector<ggml_tensor *> codes_in(CODEC_NUM_VQ);
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    std::vector<ggml_tensor *> codes_in(n_vq);
+    for (int i = 0; i < n_vq; ++i) {
         codes_in[i] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_audio);
         ggml_set_name(codes_in[i], ("codes_" + std::to_string(i)).c_str());
         ggml_set_input(codes_in[i]);
@@ -845,7 +848,7 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
 
     // ── Quantizer.decode_codes ─────────────────────────────────────────────
     ggml_tensor * sum = nullptr;
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    for (int i = 0; i < n_vq; ++i) {
         // (codebook_dim=8, T) via embedding lookup → f32 (get_rows promotes)
         ggml_tensor * z = ggml_get_rows(gctx, m_codebook[i], codes_in[i]);
         // Conv1d 8 → 512 (kernel=1). w stored as (in=8, out=512) f16.
@@ -879,7 +882,7 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
     }
 
     // ── Upload inputs ──────────────────────────────────────────────────────
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    for (int i = 0; i < n_vq; ++i) {
         std::vector<int32_t> col(T_audio);
         for (int t = 0; t < T_audio; ++t) col[size_t(t)] = codes[i * T_audio + t];
         ggml_backend_tensor_set(codes_in[i], col.data(), 0,

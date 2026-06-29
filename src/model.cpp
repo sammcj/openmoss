@@ -451,6 +451,12 @@ std::unique_ptr<Model> Model::load(const std::string & gguf_path, const LoadOpti
     ggml_free(bb_spec.meta_ctx);
 
     // Cache convenient dim shortcuts on Aux.
+    // Hidden size must come from the model, not the ModelDims default (4096, sized
+    // for the Qwen3-8B backbone). token_embd is [hidden, vocab], so its ne[0] is the
+    // true hidden size — 2048 for smaller variants like MOSS-VoiceGenerator. Using
+    // 4096 there reads the embedding output out of bounds.
+    if (self->m_aux->text_embed && self->m_aux->text_embed->ne[0] > 0)
+        self->m_dims.hidden_size = int32_t(self->m_aux->text_embed->ne[0]);
     self->m_aux->hidden_size      = self->m_dims.hidden_size;
     self->m_aux->n_vq             = self->m_dims.n_vq;
     self->m_aux->audio_vocab_full = self->m_dims.audio_vocab_size + 1;
