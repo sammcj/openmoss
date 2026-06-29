@@ -25,6 +25,7 @@
 
 #include "aux_internal.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ggml.h"
@@ -72,21 +74,35 @@ bool kv_bool(gguf_context * gctx, const char * key, bool fallback) {
     return gguf_get_val_bool(gctx, k);
 }
 
-// Enumerate registered ggml devices that report as GPU/IGPU/ACCEL. Order
-// matches both ggml's registration order and libllama's `main_gpu` indexing,
-// so we can pass the same index to `llama_model_params.main_gpu` and use the
-// same device for the aux backend.
+// Enumerate registered ggml devices that report as GPU/IGPU/ACCEL, deduplicated
+// by PCI id. libllama drops a device whose id already appeared (e.g. the Vulkan
+// view of a GPU already claimed by CUDA when both backends are loaded), so the
+// raw ggml list is longer than llama's: picking an index into the raw list can
+// then exceed `llama_model_params.main_gpu`'s valid range (the load aborts with
+// "invalid value for main_gpu"). Dedup the same way — keep the first device per
+// id — so our index lines up with llama's and selects the same physical device.
 std::vector<ggml_backend_dev_t> list_gpu_devs() {
     std::vector<ggml_backend_dev_t> out;
+    std::vector<std::string> seen_ids;
     const size_t n = ggml_backend_dev_count();
     for (size_t i = 0; i < n; ++i) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
         const auto t = ggml_backend_dev_type(d);
-        if (t == GGML_BACKEND_DEVICE_TYPE_GPU
-         || t == GGML_BACKEND_DEVICE_TYPE_IGPU
-         || t == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-            out.push_back(d);
+        if (t != GGML_BACKEND_DEVICE_TYPE_GPU
+         && t != GGML_BACKEND_DEVICE_TYPE_IGPU
+         && t != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            continue;
         }
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(d, &props);
+        if (props.device_id && *props.device_id) {
+            std::string id = props.device_id;
+            if (std::find(seen_ids.begin(), seen_ids.end(), id) != seen_ids.end()) {
+                continue;  // a different backend's view of a device we already kept
+            }
+            seen_ids.push_back(std::move(id));
+        }
+        out.push_back(d);
     }
     return out;
 }
