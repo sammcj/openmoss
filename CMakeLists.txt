@@ -10,96 +10,26 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# ───── Locate llama.cpp ─────────────────────────────────────────────────────
-set(LLAMA_CPP_DIR "" CACHE PATH "Path to a built llama.cpp source tree")
-if(NOT LLAMA_CPP_DIR)
-    message(FATAL_ERROR
-        "LLAMA_CPP_DIR must be set to the root of a built llama.cpp tree.\n"
-        "  cmake -B build -DLLAMA_CPP_DIR=/path/to/llama.cpp")
-endif()
+# ───── Vendored llama.cpp (provides libllama + ggml) ────────────────────────
+# openmoss runs the Qwen3 backbone through libllama, so it needs the full tree,
+# not just ggml. Built in-tree; the GPU backend is selected with the upstream
+# flags (-DGGML_CUDA=ON / -DGGML_VULKAN=ON). Trim the parts we don't use.
+set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
 
-set(LLAMA_CPP_INCLUDE      "${LLAMA_CPP_DIR}/include")
-set(GGML_INCLUDE            "${LLAMA_CPP_DIR}/ggml/include")
+# Colocate the shared libs (and DLLs on Windows) with our executables so they
+# resolve via $ORIGIN / the exe directory, both in-tree and once packaged.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-# ───── Platform-specific library paths ──────────────────────────────────────
-if(WIN32)
-    # MSVC puts binaries in build/bin/Release/ and import libs in build/*/Release/
-    set(LLAMA_CPP_BUILD_BIN    "${LLAMA_CPP_DIR}/build/bin/Release")
-    set(LLAMA_CPP_BUILD_LIB    "${LLAMA_CPP_DIR}/build/src/Release")
-    set(GGML_BUILD_LIB         "${LLAMA_CPP_DIR}/build/ggml/src/Release")
+add_subdirectory(third_party/llama.cpp)
 
-    set(LLAMA_LIB_SUFFIX       ".dll")
-    set(LLAMA_IMPLIB_SUFFIX    ".lib")
-else()
-    set(LLAMA_CPP_BUILD_BIN    "${LLAMA_CPP_DIR}/build/bin")
-    set(LLAMA_CPP_BUILD_LIB    "${LLAMA_CPP_BUILD_BIN}")
-    set(GGML_BUILD_LIB         "${LLAMA_CPP_BUILD_BIN}")
-
-    if(APPLE)
-        set(LLAMA_LIB_SUFFIX   ".dylib")
-    else()
-        set(LLAMA_LIB_SUFFIX   ".so")
-    endif()
-    set(LLAMA_IMPLIB_SUFFIX    "")
-endif()
-
-if(NOT EXISTS "${LLAMA_CPP_INCLUDE}/llama.h")
-    message(FATAL_ERROR "llama.h not found at ${LLAMA_CPP_INCLUDE}")
-endif()
-
-# ───── Imported targets for llama.cpp libraries ─────────────────────────────
-add_library(llama SHARED IMPORTED)
-if(WIN32)
-    set_target_properties(llama PROPERTIES
-        IMPORTED_LOCATION             "${LLAMA_CPP_BUILD_BIN}/llama${LLAMA_LIB_SUFFIX}"
-        IMPORTED_IMPLIB               "${LLAMA_CPP_BUILD_LIB}/llama${LLAMA_IMPLIB_SUFFIX}"
-        INTERFACE_INCLUDE_DIRECTORIES "${LLAMA_CPP_INCLUDE};${GGML_INCLUDE}")
-else()
-    set_target_properties(llama PROPERTIES
-        IMPORTED_LOCATION             "${LLAMA_CPP_BUILD_BIN}/libllama${LLAMA_LIB_SUFFIX}"
-        INTERFACE_INCLUDE_DIRECTORIES "${LLAMA_CPP_INCLUDE};${GGML_INCLUDE}")
-endif()
-
-add_library(ggml SHARED IMPORTED)
-if(WIN32)
-    set_target_properties(ggml PROPERTIES
-        IMPORTED_LOCATION             "${LLAMA_CPP_BUILD_BIN}/ggml${LLAMA_LIB_SUFFIX}"
-        IMPORTED_IMPLIB               "${GGML_BUILD_LIB}/ggml${LLAMA_IMPLIB_SUFFIX}"
-        INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE}")
-else()
-    set_target_properties(ggml PROPERTIES
-        IMPORTED_LOCATION             "${LLAMA_CPP_BUILD_BIN}/libggml${LLAMA_LIB_SUFFIX}"
-        INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE}")
-endif()
-
-add_library(ggml-base SHARED IMPORTED)
-if(WIN32)
-    set_target_properties(ggml-base PROPERTIES
-        IMPORTED_LOCATION             "${LLAMA_CPP_BUILD_BIN}/ggml-base${LLAMA_LIB_SUFFIX}"
-        IMPORTED_IMPLIB               "${GGML_BUILD_LIB}/ggml-base${LLAMA_IMPLIB_SUFFIX}"
-        INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE}")
-else()
-    set_target_properties(ggml-base PROPERTIES
-        IMPORTED_LOCATION             "${LLAMA_CPP_BUILD_BIN}/libggml-base${LLAMA_LIB_SUFFIX}"
-        INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE}")
-endif()
-
-# ───── Runtime library discovery (Windows: PATH, Linux: rpath) ─────────────
-if(WIN32)
-    # On Windows, copy llama DLLs next to our executables so they are found at runtime.
-    set(LLAMA_DLLS
-        "${LLAMA_CPP_BUILD_BIN}/llama.dll"
-        "${LLAMA_CPP_BUILD_BIN}/ggml.dll"
-        "${LLAMA_CPP_BUILD_BIN}/ggml-base.dll"
-        "${LLAMA_CPP_BUILD_BIN}/ggml-cpu.dll"
-    )
-    # Also copy CUDA DLLs if they exist
-    file(GLOB LLAMA_CUDA_DLLS "${LLAMA_CPP_BUILD_BIN}/ggml-cuda*.dll")
-    set(LLAMA_ALL_DLLS ${LLAMA_DLLS} ${LLAMA_CUDA_DLLS})
-else()
-    set(CMAKE_INSTALL_RPATH         "${LLAMA_CPP_BUILD_BIN}")
-    set(CMAKE_BUILD_RPATH           "${LLAMA_CPP_BUILD_BIN}")
-    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+if(NOT WIN32)
+    set(CMAKE_BUILD_RPATH   "$ORIGIN")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
     if(APPLE)
         set(CMAKE_MACOSX_RPATH ON)
     endif()
@@ -134,14 +64,6 @@ endif()
 add_executable(moss-tts-cli src/cli/moss_tts_cli.cpp)
 target_link_libraries(moss-tts-cli PRIVATE openmoss_core)
 
-if(WIN32)
-    foreach(DLL ${LLAMA_ALL_DLLS})
-        add_custom_command(TARGET moss-tts-cli POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "$<TARGET_FILE_DIR:moss-tts-cli>"
-            COMMENT "Copying ${DLL}")
-    endforeach()
-endif()
-
 # ───── Server binary ───────────────────────────────────────────────────────
 add_executable(moss-tts-server src/server/moss_tts_server.cpp)
 target_link_libraries(moss-tts-server PRIVATE openmoss_core)
@@ -152,12 +74,6 @@ target_link_libraries(moss-tts-server PRIVATE Threads::Threads)
 if(WIN32)
     # Link ws2_32 for httplib on Windows
     target_link_libraries(moss-tts-server PRIVATE ws2_32)
-
-    foreach(DLL ${LLAMA_ALL_DLLS})
-        add_custom_command(TARGET moss-tts-server POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DLL}" "$<TARGET_FILE_DIR:moss-tts-server>"
-            COMMENT "Copying ${DLL}")
-    endforeach()
 endif()
 
 # Make the bundled WebUI available next to the server binary so it auto-detects
