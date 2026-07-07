@@ -439,7 +439,7 @@ int main(int argc, char ** argv) {
         // We approximate: 1s of audio ≈ 12.5 tokens, and the default model output
         // is roughly 4096 tokens ≈ 328s.  speed just multiplies the budget.
         double speed = jget(body, "speed", 1.0);
-        if (speed <= 0.0 || speed > 4.0) {
+        if (speed < 0.25 || speed > 4.0) {
             return send_text_error(rs, 400,
                 "speed must be between 0.25 and 4.0");
         }

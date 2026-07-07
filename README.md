@@ -18,6 +18,11 @@ On a single 16 GB GPU (RTX 5060 Ti) the Q8\_0 backbone produces ~10 s of speech 
 wall-clock; the codec runs at ~50× real-time. See `docs/STATUS.md` for a detailed feature matrix,
 pipeline diagram, and benchmark numbers.
 
+Prebuilt binaries for Linux and Windows (Vulkan, ROCm, CUDA) are published on the
+[releases page](../../releases) — each archive bundles the llama.cpp libraries it was built
+against, so no separate llama.cpp build is needed. Serves as the `openmoss` backend of
+[Lemonade](https://github.com/lemonade-sdk/lemonade).
+
 ## Quick start
 
 ```bash
@@ -243,8 +248,11 @@ This allows drop-in compatibility with any client or SDK that targets the OpenAI
 | `input`            | string | yes      | text to synthesize (maps to native `text`)                  |
 | `model`            | string | no       | ignored (the model is already loaded at server startup)     |
 | `voice`            | string | no       | passed as an instruction hint to the model                  |
-| `response_format`  | string | no       | `"wav"` (default and only supported format)                 |
+| `response_format`  | string | no       | `"wav"` (default and only supported format; anything else is a 400) |
 | `speed`            | float  | no       | 0.25–4.0, scales the token budget (default 1.0)             |
+
+Validation errors (missing/non-string `input`, undecodable or non-WAV `reference_wav_b64`,
+out-of-range `speed`, unsupported `response_format`) return `400` with a `text/plain` message.
 
 Response: `audio/wav` (16-bit PCM @ 24 kHz mono), same as the native endpoint.
 
