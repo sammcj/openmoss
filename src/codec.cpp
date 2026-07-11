@@ -73,25 +73,27 @@ struct StageSpec {
     int output_dim;
     int patch_after;     // upsample factor of the PatchedPretransform that follows; 0 if none
     int gguf_idx;        // dec.<this>
+    int context;         // causal attention window in keys:
+                         // stage frame rate × causal_transformer_context_duration (10 s)
 };
 
 constexpr std::array<StageSpec, 4> DECODER_STAGES = {{
-    //   in   d   nh   dff  nl  out  patch  gguf
-    {  768, 1280, 20, 5120, 32, 1280,    2,    0 },  // dec.0 + dec.1 patch
-    {  640,  768, 12, 3072, 12,  768,    2,    2 },  // dec.2 + dec.3 patch
-    {  384,  768, 12, 3072, 12,  768,    2,    4 },  // dec.4 + dec.5 patch
-    {  384,  768, 12, 3072, 12,  240,  240,    6 },  // dec.6 + dec.7 patch
+    //   in   d   nh   dff  nl  out  patch  gguf  ctx
+    {  768, 1280, 20, 5120, 32, 1280,    2,    0,  125 },  // dec.0 @ 12.5 Hz + dec.1 patch
+    {  640,  768, 12, 3072, 12,  768,    2,    2,  250 },  // dec.2 @ 25 Hz   + dec.3 patch
+    {  384,  768, 12, 3072, 12,  768,    2,    4,  500 },  // dec.4 @ 50 Hz   + dec.5 patch
+    {  384,  768, 12, 3072, 12,  240,  240,    6, 1000 },  // dec.6 @ 100 Hz  + dec.7 patch
 }};
 
 // Encoder mirrors the decoder. The initial patch=240 happens BEFORE the first
 // transformer stage; `patch_after` here is the patch that follows the stage.
 constexpr int CODEC_PRE_PATCH = 240;
 constexpr std::array<StageSpec, 4> ENCODER_STAGES = {{
-    //   in   d   nh   dff  nl  out  patch  gguf
-    {  240,  768, 12, 3072, 12,  384,    2,    1 },  // enc.1 + enc.2 patch
-    {  768,  768, 12, 3072, 12,  384,    2,    3 },  // enc.3 + enc.4 patch
-    {  768,  768, 12, 3072, 12,  640,    2,    5 },  // enc.5 + enc.6 patch
-    { 1280, 1280, 20, 5120, 32,  768,    0,    7 },  // enc.7 (no patch after)
+    //   in   d   nh   dff  nl  out  patch  gguf  ctx
+    {  240,  768, 12, 3072, 12,  384,    2,    1, 1000 },  // enc.1 @ 100 Hz  + enc.2 patch
+    {  768,  768, 12, 3072, 12,  384,    2,    3,  500 },  // enc.3 @ 50 Hz   + enc.4 patch
+    {  768,  768, 12, 3072, 12,  640,    2,    5,  250 },  // enc.5 @ 25 Hz   + enc.6 patch
+    { 1280, 1280, 20, 5120, 32,  768,    0,    7,  125 },  // enc.7 @ 12.5 Hz (no patch after)
 }};
 
 // f16 representation helpers (we store everything as f16 on the backend).
@@ -238,7 +240,7 @@ private:
                                 ggml_tensor * mask) const;
     // Build an (T, T) f16 causal mask input tensor for flash attention.
     static ggml_tensor * make_causal_mask_(ggml_context * gctx, int64_t T);
-    static void fill_causal_mask_(ggml_tensor * mask);
+    static void fill_causal_mask_(ggml_tensor * mask, int64_t context);
     static ggml_tensor * patch_upsample_(ggml_context * gctx,
                                           ggml_tensor * x, int patch);
     static ggml_tensor * patch_downsample_(ggml_context * gctx,
@@ -702,7 +704,14 @@ ggml_tensor * CodecGraphs::make_causal_mask_(ggml_context * gctx, int64_t T) {
     return m;
 }
 
-void CodecGraphs::fill_causal_mask_(ggml_tensor * mask) {
+// The codec transformers are trained with a *sliding-window* causal mask
+// (config `causal_transformer_context_duration` = 10 s → per-stage window of
+// frame_rate × 10 keys; upstream: `attn_bias = (delta >= 0) & (delta <
+// context)`). Attending past that window feeds the model RoPE distances it
+// never saw in training and audio quality collapses progressively after the
+// 10 s mark (issue #7), so the band limit is not an optimisation — it is part
+// of the model.
+void CodecGraphs::fill_causal_mask_(ggml_tensor * mask, int64_t context) {
     const int64_t T = mask->ne[0];
     static const uint16_t F16_ZERO = 0x0000;
     static const uint16_t F16_NEG_INF = 0xFC00;
@@ -710,7 +719,7 @@ void CodecGraphs::fill_causal_mask_(ggml_tensor * mask) {
     for (int64_t q = 0; q < T; ++q) {
         uint16_t * row = buf.data() + size_t(q) * size_t(T);
         for (int64_t kv = 0; kv < T; ++kv) {
-            row[kv] = (kv <= q) ? F16_ZERO : F16_NEG_INF;
+            row[kv] = (kv <= q && q - kv < context) ? F16_ZERO : F16_NEG_INF;
         }
     }
     ggml_backend_tensor_set(mask, buf.data(), 0, buf.size() * sizeof(uint16_t));
@@ -894,7 +903,7 @@ std::vector<float> CodecGraphs::decode(const int32_t * codes,
         for (int t = 0; t < T_at[s]; ++t) p[size_t(t)] = t;
         ggml_backend_tensor_set(pos_T[s], p.data(), 0,
                                 p.size() * sizeof(int32_t));
-        fill_causal_mask_(mask_T[s]);
+        fill_causal_mask_(mask_T[s], DECODER_STAGES[s].context);
     }
 
     if (ggml_backend_graph_compute(aux->backend, graph) != GGML_STATUS_SUCCESS) {
@@ -1028,7 +1037,7 @@ std::vector<int32_t> CodecGraphs::encode(const float * waveform,
         p.resize(size_t(T_at[s]));
         for (int t = 0; t < T_at[s]; ++t) p[size_t(t)] = t;
         ggml_backend_tensor_set(pos_T[s], p.data(), 0, p.size() * sizeof(int32_t));
-        fill_causal_mask_(mask_T[s]);
+        fill_causal_mask_(mask_T[s], ENCODER_STAGES[s].context);
     }
 
     if (ggml_backend_graph_compute(aux->backend, graph) != GGML_STATUS_SUCCESS) {

@@ -71,12 +71,19 @@ struct Rng {
 
 namespace {
 
+// Penalize each token that appears in the history exactly ONCE, no matter how
+// often it occurs — the reference (`apply_repetition_penalty_delay_pattern`)
+// runs the penalty over `torch.unique(prev_tokens)`. Penalizing per occurrence
+// compounds to penalty^k for a token seen k times; with a 1024-code audio
+// vocab at 12.5 frames/s that distorts the distribution more every second.
 void apply_repetition_penalty(float * logits, int vocab,
                               const std::vector<int32_t> & history,
                               float penalty) {
     if (penalty == 1.0f) return;
+    std::vector<bool> seen(size_t(vocab), false);
     for (int32_t id : history) {
-        if (id < 0 || id >= vocab) continue;
+        if (id < 0 || id >= vocab || seen[size_t(id)]) continue;
+        seen[size_t(id)] = true;
         if (logits[id] > 0) logits[id] /= penalty;
         else                logits[id] *= penalty;
     }
