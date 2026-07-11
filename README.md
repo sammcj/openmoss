@@ -26,18 +26,22 @@ against, so no separate llama.cpp build is needed. Serves as the `openmoss` back
 ## Quick start
 
 ```bash
-# 1. Build (assumes a built llama.cpp tree)
-cmake -B build -DLLAMA_CPP_DIR=/path/to/llama.cpp -DGGML_CUDA=ON
+# 1. Build (llama.cpp is bundled as a submodule and built in-tree)
+git clone --recurse-submodules https://github.com/pwilkin/openmoss
+cd openmoss
+cmake -B build -DGGML_CUDA=ON     # or -DGGML_VULKAN=ON / -DGGML_HIP=ON / nothing for CPU
 cmake --build build -j
 
-# 2. Convert weights once
+# 2. Convert weights once (or download a pre-built GGUF — see "Convert weights")
 python scripts/convert_hf_to_gguf.py \
     --moss-tts OpenMOSS-Team/MOSS-TTS \
     --codec    OpenMOSS-Team/MOSS-Audio-Tokenizer \
     --output   weights/moss-tts.gguf
 
-# 3. (Optional) quantize the backbone — keep the embedding table as f16
-/path/to/llama.cpp/build/bin/llama-quantize \
+# 3. (Optional) quantize the backbone — keep the embedding table as f16.
+#    llama-quantize comes from any llama.cpp build/release (the in-tree
+#    submodule build skips llama.cpp's tools).
+llama-quantize \
     --token-embedding-type f16 \
     weights/moss-tts.gguf weights/moss-tts-q8_0.gguf Q8_0
 
@@ -50,24 +54,23 @@ python scripts/convert_hf_to_gguf.py \
 
 ## Build
 
+llama.cpp is **bundled as a git submodule** (`third_party/llama.cpp`) and built in-tree —
+no separate llama.cpp build or `-DLLAMA_CPP_DIR` flag is needed. Pick the GPU backend with
+the usual upstream flags (`-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`, `-DGGML_HIP=ON`, … — none
+for CPU-only).
+
 Prerequisites:
 
-- A built llama.cpp tree. On Linux: `libllama.so`, `libggml*.so`; on Windows (MSVC):
-  `llama.dll`, `ggml.dll`, `ggml-base.dll` and their `.lib` import libraries.
-  Headers under `ggml/include/` and `include/`. Build it with the same backend you
-  want here (`-DGGML_CUDA=ON` for NVIDIA, etc.).
-- CMake ≥ 3.18, a C++17 compiler (GCC/Clang on Linux, MSVC on Windows).
-- `nlohmann/json.hpp` (only the header is needed; on Debian/Ubuntu: `apt install
-  nlohmann-json3-dev`). A vendored copy is included in `third_party/nlohmann/json.hpp`.
-- The HTTP server is built against a vendored copy of `cpp-httplib` v0.18.7
-  (`third_party/cpp-httplib/httplib.h`); no extra system dep.
+- The submodules checked out: `git clone --recurse-submodules …` (or, in an existing
+  checkout, `git submodule update --init --recursive`).
+- CMake ≥ 3.18, a C++17 compiler (GCC/Clang on Linux, MSVC on Windows), and the toolkit
+  for your chosen backend (CUDA toolkit, Vulkan SDK, ROCm, …).
+- `nlohmann/json.hpp` and `cpp-httplib` are vendored under `third_party/`; no system deps.
 
 ### Linux
 
 ```bash
-cmake -B build \
-    -DLLAMA_CPP_DIR=/devel/tools/llama.cpp \
-    -DGGML_CUDA=ON
+cmake -B build -DGGML_CUDA=ON
 cmake --build build -j
 ```
 
@@ -76,26 +79,27 @@ cmake --build build -j
 Open a **Developer Command Prompt for VS** (or `vcvarsall.bat x64`), then:
 
 ```cmd
-cmake -B build -DLLAMA_CPP_DIR=/path/to/llama.cpp -DGGML_CUDA=ON
+cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release -j
 ```
 
-The Windows build automatically:
-- Locates DLLs in `build/bin/Release/` and import libs in `build/src/Release/`
-- Copies llama.cpp DLLs (including CUDA) next to the executables via POST_BUILD steps
-- Links `ws2_32` (Winsock) for the HTTP server
+`ws2_32` (Winsock) is linked automatically for the HTTP server.
 
 ### Outputs
+
+Executables land in the build root; the llama.cpp/ggml shared libraries in `build/bin/`
+(they resolve via RPATH on Linux — with MSVC, copy the DLLs next to the executables or
+add `build\bin\Release` to `PATH`).
 
 Linux:
 - `build/moss-tts-cli`
 - `build/moss-tts-server`
 - `build/moss-tts-info`, `build/moss-tts-compute-test`, `build/moss-codec-roundtrip` (diagnostics)
+- `build/bin/libllama.so`, `build/bin/libggml*.so`
 
-Windows:
-- `build/Release/moss-tts-cli.exe`
-- `build/Release/moss-tts-server.exe`
-- `build/tests/Release/moss-tts-info.exe`, etc.
+Windows (MSVC):
+- `build/Release/moss-tts-cli.exe`, `build/Release/moss-tts-server.exe` (+ diagnostics)
+- `build/bin/Release/llama.dll`, `ggml*.dll`
 
 ## Convert weights
 
@@ -118,13 +122,14 @@ python scripts/convert_hf_to_gguf.py \
     --moss-tts OpenMOSS-Team/MOSS-TTS \
     --codec    OpenMOSS-Team/MOSS-Audio-Tokenizer \
     --output   weights/moss-tts.gguf \
-    --llama-cpp-dir /path/to/llama.cpp \
     --backbone-dtype f16
 ```
 
-Useful flags: `--cache-dir` for the HF cache, `--scratch-dir`/`--keep-scratch` for inspecting the
-intermediate extracted backbone, `--skip-extract` to reuse a previously-extracted backbone if you
-already ran a conversion.
+Useful flags: `--llama-cpp-dir` to point at a different llama.cpp source tree (the converter
+shells out to llama.cpp's own `convert_hf_to_gguf.py`; by default it uses the bundled
+`third_party/llama.cpp` submodule — no llama.cpp *build* is required), `--cache-dir` for the
+HF cache, `--scratch-dir`/`--keep-scratch` for inspecting the intermediate extracted backbone,
+`--skip-extract` to reuse a previously-extracted backbone if you already ran a conversion.
 
 ### Quantization
 
@@ -162,8 +167,11 @@ Common options:
 | `--max-new-tokens N`  | generation cap (default 4096)                                      |
 | `--main-gpu N`        | pin model to GPU index N (default: auto-pick GPU with most free VRAM) |
 | `--n-gpu-layers N`    | backbone GPU offload (default: all)                                |
+| `--n-batch N`         | libllama batch size (default 512); raise if a long prompt exceeds it |
+| `--n-ctx N`           | libllama context size (default 8192)                               |
 | `--no-flash-attn`     | disable flash attention                                            |
 | `--skip-codec`        | don't load codec tensors; emits codes only (debug, saves ~3.4 GB)  |
+| `--aux-cpu`           | run audio embeds + codec on CPU (workaround for backends missing ops); backbone stays on GPU |
 
 ### Plain TTS
 
@@ -199,8 +207,8 @@ clean speech is usually enough.
 ./build/moss-tts-server --model weights/moss-tts-q8_0.gguf --host 0.0.0.0 --port 8080
 ```
 
-`moss-tts-server` shares the same `--main-gpu`, `--n-gpu-layers`, `--no-flash-attn`, and
-`--skip-codec` flags as the CLI. Generations are serialized through a single mutex (libllama
+`moss-tts-server` shares the same `--main-gpu`, `--n-gpu-layers`, `--n-batch`, `--n-ctx`,
+`--no-flash-attn`, `--skip-codec`, and `--aux-cpu` flags as the CLI. Generations are serialized through a single mutex (libllama
 state is not reentrant); concurrent requests queue cleanly.
 
 Additional flags:
@@ -393,6 +401,11 @@ fits.
                             ▼
                        waveform (f32, 24 kHz)  →  16-bit WAV
 ```
+
+The codec transformers use *sliding-window* causal attention: each stage attends to at most
+10 s of context (`causal_transformer_context_duration` upstream — 125 keys at 12.5 Hz up to
+1000 keys at 100 Hz). The window is part of the trained model, not an optimization; decoding
+with unbounded attention degrades audio progressively past the 10 s mark (issue #7).
 
 For the full per-stage tensor shapes, list of bugs hit during bring-up, and benchmark numbers,
 see [`docs/STATUS.md`](docs/STATUS.md).

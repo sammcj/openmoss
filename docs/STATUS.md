@@ -3,13 +3,13 @@
 | #  | Task                                                  | Status               | Notes |
 |----|-------------------------------------------------------|----------------------|-------|
 | 1  | Investigate codec architecture                        | done                 | 1.6B pure-transformer, 4 stages × downsample 240/2/2/2, RLFQ 32×1024 |
-| 2  | Project scaffolding (CMake, dirs, headers, stubs)     | done                 | builds clean against `/devel/tools/llama.cpp` |
+| 2  | Project scaffolding (CMake, dirs, headers, stubs)     | done                 | builds clean against the vendored `third_party/llama.cpp` submodule |
 | 3  | GGUF converter (HF → backbone GGUF + sidecar GGUF)    | **done & validated** | produces `moss-tts.gguf` (15.32 GB) + `moss-tts.extras.gguf` (4.0 GB) |
 | 4  | Core C++ inference (LM side)                          | **done & validated** | backbone via libllama, audio embeds + LM heads as GGML, delay sampling, audio code extraction |
 | 5  | Codec decoder in GGML                                 | **done & validated** | 68 transformer layers + RLFQ + 4 patched upsamples, end-to-end on CUDA |
 | 6  | Voice cloning (codec encoder)                         | **done & validated** | encoder mirrors decoder; round-trip envelope correlation 1.000 against the original WAV |
 | 7  | CLI binary                                            | **done**             | runs end-to-end on real weights and writes a 24 kHz mono WAV |
-| 8  | Server binary                                         | **done**             | cpp-httplib v0.18.7 vendored; `GET /health`, `GET /info`, `POST /tts` (JSON in, audio/wav out, optional `reference_wav_b64` for cloning) |
+| 8  | Server binary                                         | **done**             | cpp-httplib v0.18.7 vendored; `GET /health`, `GET /info`, `POST /tts` (JSON in, audio/wav out, optional `reference_wav_b64` for cloning), `POST /v1/audio/speech` (OpenAI-compatible), static WebUI at `/` |
 | 9  | Quantization validation                               | **done**             | `llama-quantize --token-embedding-type f16 ... Q8_0` → ~8.7 GB; Q4\_K\_M → ~4.7 GB |
 
 ## End-to-end demo
@@ -124,8 +124,11 @@ text  ─▶ Tokenizer (libllama BPE)
 | `src/pipeline.cpp`                             | Prompt builder + autoregressive generation loop + codec  |
 | `src/wav.cpp`                                  | RIFF/WAVE I/O, no libsndfile dep                         |
 | `src/cli/moss_tts_cli.cpp`                     | CLI entry point                                          |
-| `src/server/moss_tts_server.cpp`               | HTTP server: `GET /health` + `GET /info` + `POST /tts`   |
+| `src/server/moss_tts_server.cpp`               | HTTP server: `/health`, `/info`, `/tts`, `/v1/audio/speech` + static WebUI mount |
+| `webui/`                                       | Browser WebUI (vanilla HTML/CSS/JS, IndexedDB history)   |
+| `scripts/launch-webui.{sh,bat}`                | Server + WebUI launcher                                  |
 | `third_party/cpp-httplib/httplib.h`            | Single-header HTTP library (vendored from upstream v0.18.7) |
+| `third_party/llama.cpp`                        | llama.cpp submodule (libllama + ggml), built in-tree     |
 | `tests/moss_tts_info.cpp`                      | Diagnostic: load, dump dims                              |
 | `tests/moss_tts_compute.cpp`                   | Smoke test for embedding + audio-head graphs             |
 | `tests/moss_codec_roundtrip.cpp`               | Codec encode→decode round-trip + per-codebook stats      |
@@ -148,6 +151,25 @@ text  ─▶ Tokenizer (libllama BPE)
 
 Both bugs only surface once the codec is actually invoked, which is why
 they slipped past the LM-only smoke tests in tasks 3-4.
+
+3. **Codec attention missing the 10 s sliding window** (`src/codec.cpp`,
+   issue #7). The codec transformers are trained with a windowed causal mask
+   (`causal_transformer_context_duration` = 10 s → per-stage window of
+   frame_rate × 10 keys: 125/250/500/1000 for the decoder, mirrored for the
+   encoder; upstream `attn_bias = (delta >= 0) & (delta < context)`). Our
+   masks were plain lower-triangular, so past 10 s every layer attended over
+   RoPE distances never seen in training and audio degraded progressively
+   (crackling, robotic voice, falling volume). Verified with a 40 s
+   encode→decode round-trip: envelope correlation fell from 0.999 to ~0.96
+   after the 10 s mark with the unbounded mask, and stays ≥ 0.999 end-to-end
+   with the banded mask.
+
+4. **Repetition penalty compounded per occurrence** (`src/delay.cpp`). The
+   reference penalizes `torch.unique(prev_tokens)` — each token once — while
+   we penalized per occurrence, i.e. penalty^k for a token seen k times. With
+   a 1024-code audio vocab at 12.5 frames/s this distorts the distribution
+   more every second. Invisible at the library default penalty of 1.0, but
+   the server defaults to 1.1.
 
 ## Open issues / future work
 

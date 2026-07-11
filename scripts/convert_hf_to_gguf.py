@@ -602,8 +602,11 @@ def main():
     ap.add_argument("--codec", default=None,
                     help="HF id or local dir of MOSS-Audio-Tokenizer; omit to skip codec for now")
     ap.add_argument("--output", required=True, help="Output GGUF path")
-    ap.add_argument("--llama-cpp-dir", default="/devel/tools/llama.cpp",
-                    help="Path to a built llama.cpp tree (we shell out to convert_hf_to_gguf.py)")
+    ap.add_argument("--llama-cpp-dir",
+                    default=str(Path(__file__).resolve().parent.parent / "third_party" / "llama.cpp"),
+                    help="Path to a llama.cpp source tree — we shell out to its "
+                         "convert_hf_to_gguf.py and import its gguf-py (no build needed). "
+                         "Default: the bundled third_party/llama.cpp submodule.")
     ap.add_argument("--cache-dir", default=None,
                     help="HF cache dir (defaults to ~/.cache/huggingface)")
     ap.add_argument("--scratch-dir", default=None,
